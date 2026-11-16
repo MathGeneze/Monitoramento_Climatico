@@ -1,3 +1,4 @@
+import re
 import streamlit as st
 import requests
 import pandas as pd
@@ -10,24 +11,146 @@ st.set_page_config(
     layout="wide"
 )
 
-# Regiões da Grande São Paulo para consulta
-LOCAIS = {
-    "São Paulo - Centro / Zona Sul": (-23.5505, -46.6333),
-    "São Paulo - Zona Leste": (-23.5489, -46.4714),
-    "São Paulo - Zona Norte": (-23.4801, -46.6256),
-    "São Paulo - Zona Oeste": (-23.5567, -46.7235),
-    "ABC Paulista (Santo André)": (-23.6639, -46.5383),
-    "Guarulhos": (-23.4543, -46.5337),
-}
+# ==============================================================================
+# CONFIGURAÇÃO DO ENDEREÇO PADRÃO
+# ==============================================================================
+ENDERECO_PADRAO = "Rua Cachoeira do Sul, 271, Vila Jaguara, São Paulo, SP"
 
-@st.cache_data(ttl=1800)
+
+def restaurar_endereco():
+    """Restaura o endereço padrão antes da renderização dos componentes."""
+    st.session_state.endereco_busca = ENDERECO_PADRAO
+
+
+def _buscar_photon(query: str) -> list:
+    """Busca coordenadas via Photon (Komoot/OpenStreetMap), ideal para ruas e bairros."""
+    url = "https://photon.komoot.io/api/"
+    params = {"q": query, "limit": 5}
+    headers = {"User-Agent": "PainelClimaticoExtensaoODS13/1.0"}
+    resp = requests.get(url, params=params, headers=headers, timeout=10)
+    resp.raise_for_status()
+    features = resp.json().get("features", [])
+
+    resultados = []
+    for feat in features:
+        props = feat.get("properties", {})
+        pais = props.get("country", "")
+        if pais and pais.lower() not in ("brasil", "brazil"):
+            continue
+
+        lon, lat = feat["geometry"]["coordinates"]
+        rua = props.get("street") or props.get("name") or ""
+        numero = props.get("housenumber", "")
+        bairro = props.get("district") or props.get("suburb") or props.get("locality") or ""
+        cidade = props.get("city") or props.get("town") or props.get("county") or ""
+        estado = props.get("state", "")
+
+        partes = []
+        if rua:
+            partes.append(f"{rua}, {numero}" if numero else rua)
+        if bairro and bairro != rua:
+            partes.append(bairro)
+        if cidade and cidade != bairro:
+            partes.append(cidade)
+        if estado:
+            partes.append(estado)
+
+        label = " - ".join(partes) if partes else query
+        resultados.append({"label": label, "lat": float(lat), "lon": float(lon)})
+
+    return resultados
+
+
+def _buscar_nominatim(query: str) -> list:
+    """Busca alternativa via Nominatim (OpenStreetMap)."""
+    url = "https://nominatim.openstreetmap.org/search"
+    params = {
+        "q": query,
+        "format": "json",
+        "limit": 5,
+        "countrycodes": "br",
+        "addressdetails": 1
+    }
+    headers = {
+        "User-Agent": "PainelClimaticoExtensaoODS13/1.0",
+        "Accept-Language": "pt-BR"
+    }
+    resp = requests.get(url, params=params, headers=headers, timeout=10)
+    resp.raise_for_status()
+    dados = resp.json()
+
+    resultados = []
+    for item in dados:
+        end = item.get("address", {})
+        rua = end.get("road") or end.get("pedestrian") or item.get("name", "")
+        numero = end.get("house_number", "")
+        bairro = end.get("suburb") or end.get("neighbourhood") or end.get("city_district", "")
+        cidade = end.get("city") or end.get("town") or end.get("municipality", "")
+        estado = end.get("state", "")
+
+        partes = []
+        if rua:
+            partes.append(f"{rua}, {numero}" if numero else rua)
+        if bairro and bairro != rua:
+            partes.append(bairro)
+        if cidade:
+            partes.append(cidade)
+        if estado:
+            partes.append(estado)
+
+        label = " - ".join(partes) if partes else item.get("display_name", query)
+        resultados.append({
+            "label": label,
+            "lat": float(item["lat"]),
+            "lon": float(item["lon"])
+        })
+
+    return resultados
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def geocodificar_local(consulta: str) -> list:
+    """Tenta localizar o endereço completo e aplica simplificações progressivas se necessário."""
+    tentativas = [consulta]
+
+    # Remove número predial caso o número exato não esteja no mapa
+    sem_numero = re.sub(r",?\s*\b\d+\b", "", consulta).strip(" ,")
+    if sem_numero and sem_numero not in tentativas:
+        tentativas.append(sem_numero)
+
+    # Simplifica para "Primeiro termo (rua ou bairro), São Paulo"
+    partes = [p.strip() for p in sem_numero.split(",") if p.strip()]
+    if len(partes) >= 2:
+        simplificada = f"{partes[0]}, {partes[-2] if partes[-1].upper() == 'SP' else partes[-1]}"
+        if simplificada not in tentativas:
+            tentativas.append(simplificada)
+
+    for termo in tentativas:
+        try:
+            res = _buscar_photon(termo)
+            if res:
+                return res
+        except Exception:
+            pass
+
+        try:
+            res = _buscar_nominatim(termo)
+            if res:
+                return res
+        except Exception:
+            pass
+
+    return []
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
 def buscar_dados_clima(lat: float, lon: float):
+    """Busca condições atuais e previsão de 7 dias na Open-Meteo usando latitude/longitude."""
     url = "https://api.open-meteo.com/v1/forecast"
     params = {
         "latitude": lat,
         "longitude": lon,
         "current": "temperature_2m,relative_humidity_2m,precipitation,wind_speed_10m,cloud_cover",
-        "hourly": "temperature_2m,precipitation_probability,precipitation",
         "daily": "temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max,uv_index_max",
         "timezone": "America/Sao_Paulo",
         "forecast_days": 7
@@ -36,38 +159,80 @@ def buscar_dados_clima(lat: float, lon: float):
     resp.raise_for_status()
     return resp.json()
 
+
 # Cabeçalho
 st.title("🌦️ Painel de Monitoramento Climático Urbano e Prevenção (ODS 13)")
 st.markdown(
-    "Projeto de Extensão Universitária — Ferramenta aberta para acompanhamento meteorológico local, "
-    "prevenção de riscos urbanos e conscientização climática comunitária."
+    "Projeto de Extensão Universitária — Monitoramento meteorológico hiperlocal por rua, "
+    "bairro ou região para prevenção de riscos urbanos e conscientização climática."
 )
 
-# Filtro lateral
-st.sidebar.header("Configurações da Consulta")
-local_escolhido = st.sidebar.selectbox("Selecione a região urbana:", list(LOCAIS.keys()))
-lat, lon = LOCAIS[local_escolhido]
+# Barra lateral com endereço padrão e busca livre
+st.sidebar.header("📍 Localização Monitorada")
 
+if "endereco_busca" not in st.session_state:
+    st.session_state.endereco_busca = ENDERECO_PADRAO
+
+termo_busca = st.sidebar.text_input(
+    "Busque por rua, bairro, CEP ou cidade:",
+    key="endereco_busca",
+    placeholder="Ex: Rua Cachoeira do Sul, 271, Vila Jaguara, SP"
+)
+
+st.sidebar.button(
+    "🏠 Restaurar endereço padrão",
+    on_click=restaurar_endereco,
+    use_container_width=True
+)
+
+if not termo_busca.strip():
+    st.info("👈 Digite o nome de uma rua, bairro ou região na barra lateral para consultar o clima.")
+    st.stop()
+
+resultados = geocodificar_local(termo_busca.strip())
+
+if not resultados:
+    st.warning(
+        f"Não encontramos o endereço **'{termo_busca}'**. "
+        "Tente buscar pelo nome da rua ou bairro seguido da cidade (ex.: *Vila Jaguara, São Paulo*)."
+    )
+    st.stop()
+
+# Seletor para confirmar o logradouro/bairro exato
+indice_escolhido = st.sidebar.selectbox(
+    "Confirme o endereço encontrado:",
+    options=range(len(resultados)),
+    format_func=lambda i: resultados[i]["label"]
+)
+
+local_selecionado = resultados[indice_escolhido]
+lat = local_selecionado["lat"]
+lon = local_selecionado["lon"]
+nome_exibicao = local_selecionado["label"]
+
+st.sidebar.caption(f"🌐 Coordenadas: `{lat:.5f}, {lon:.5f}`")
 st.sidebar.markdown("---")
 st.sidebar.info(
-    "**Objetivo (ODS 13):** Democratizar o acesso a dados climáticos locais em tempo real "
-    "e orientar moradores sobre prevenção a eventos extremos e consumo consciente."
+    "**Objetivo (ODS 13):** Democratizar o acesso a dados climáticos hiperlocais em tempo real "
+    "e orientar moradores sobre prevenção a eventos extremos."
 )
 
+# Consulta meteorológica usando as coordenadas do endereço
 try:
     dados = buscar_dados_clima(lat, lon)
     atual = dados["current"]
     diario = pd.DataFrame(dados["daily"])
     diario["time"] = pd.to_datetime(diario["time"]).dt.strftime("%d/%m")
-    horario = pd.DataFrame(dados["hourly"]).head(24)
-    horario["hora"] = pd.to_datetime(horario["time"]).dt.strftime("%H:%M")
 
-    # KPIs em tempo real
-    st.subheader(f"Condições Atuais — {local_escolhido}")
+    temp_min = diario["temperature_2m_min"].iloc[0]
+    temp_max = diario["temperature_2m_max"].iloc[0]
+
+    # KPIs: Temperatura / Mínima e Máxima / Umidade Relativa / Vento
+    st.subheader(f"Condições Atuais — {nome_exibicao}")
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("🌡️ Temperatura", f"{atual['temperature_2m']} °C")
-    c2.metric("💧 Umidade Relativa", f"{atual['relative_humidity_2m']}%")
-    c3.metric("🌧️ Precipitação Atual", f"{atual['precipitation']} mm")
+    c2.metric("↕️ Mínima / Máxima", f"{temp_min} °C / {temp_max} °C")
+    c3.metric("💧 Umidade Relativa", f"{atual['relative_humidity_2m']}%")
     c4.metric("💨 Vento", f"{atual['wind_speed_10m']} km/h")
 
     # Alertas dinâmicos para a comunidade
@@ -118,6 +283,10 @@ try:
         )
         st.plotly_chart(fig_chuva, use_container_width=True)
 
+    # Mapa da região pesquisada
+    with st.expander("🗺️ Ver localização exata no mapa", expanded=False):
+        st.map(pd.DataFrame({"lat": [lat], "lon": [lon]}), zoom=15)
+
     # Guia educativo ODS 13
     st.markdown("---")
     st.subheader("🌱 Guia Comunitário de Mitigação e Adaptação Climática (ODS 13)")
@@ -132,7 +301,7 @@ try:
         st.markdown("**3. Uso Racional da Água**")
         st.write("Reaproveite água da máquina de lavar para limpeza de áreas externas e monitore vazamentos internos.")
 
-    st.caption("Fonte de dados meteorológicos: Open-Meteo API (atualização automática a cada 30 min).")
+    st.caption("Fontes: OpenStreetMap / Photon (Geocodificação) & Open-Meteo API (Dados Meteorológicos).")
 
 except Exception as e:
     st.error(f"Não foi possível carregar os dados meteorológicos no momento: {e}")
