@@ -31,7 +31,6 @@ def restaurar_endereco():
 
 
 def _buscar_photon(query: str) -> list:
-    """Busca coordenadas via Photon (Komoot/OpenStreetMap)."""
     url = "https://photon.komoot.io/api/"
     params = {"q": query, "limit": 5}
     headers = {"User-Agent": "PainelClimaticoExtensaoODS13/1.0"}
@@ -70,7 +69,6 @@ def _buscar_photon(query: str) -> list:
 
 
 def _buscar_nominatim(query: str) -> list:
-    """Busca alternativa via Nominatim (OpenStreetMap)."""
     url = "https://nominatim.openstreetmap.org/search"
     params = {
         "q": query,
@@ -118,7 +116,6 @@ def _buscar_nominatim(query: str) -> list:
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def geocodificar_local(consulta: str) -> list:
-    """Converte endereço em coordenadas com cache de 24h."""
     if consulta.strip().lower() == ENDERECO_PADRAO.strip().lower():
         return RESULTADO_PADRAO
 
@@ -151,36 +148,8 @@ def geocodificar_local(consulta: str) -> list:
     return []
 
 
-def _consultar_open_meteo(lat: float, lon: float) -> dict:
-    """Fonte primária: Open-Meteo API."""
-    url = "https://api.open-meteo.com/v1/forecast"
-    params = {
-        "latitude": lat,
-        "longitude": lon,
-        "current": "temperature_2m,relative_humidity_2m,precipitation,wind_speed_10m",
-        "daily": "temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max,uv_index_max",
-        "timezone": "America/Sao_Paulo",
-        "forecast_days": 7
-    }
-    resp = requests.get(url, params=params, timeout=8)
-    resp.raise_for_status()
-    raw = resp.json()
-
-    daily_df = pd.DataFrame(raw["daily"])
-    return {
-        "fonte": "Open-Meteo API",
-        "current": {
-            "temperature_2m": round(float(raw["current"]["temperature_2m"]), 1),
-            "relative_humidity_2m": int(round(float(raw["current"]["relative_humidity_2m"]))),
-            "precipitation": round(float(raw["current"]["precipitation"]), 1),
-            "wind_speed_10m": round(float(raw["current"]["wind_speed_10m"]), 1),
-        },
-        "daily": daily_df.to_dict(orient="records")
-    }
-
-
 def _consultar_met_norway(lat: float, lon: float) -> dict:
-    """Fonte secundária de contingência: MET Norway Locationforecast API (sem chave, sem bloqueio por IP compartilhado)."""
+    """Fonte principal: MET Norway Locationforecast API (sem bloqueio de IP compartilhado)."""
     url = "https://api.met.no/weatherapi/locationforecast/2.0/compact"
     params = {"lat": round(lat, 4), "lon": round(lon, 4)}
     headers = {"User-Agent": "PainelClimaticoExtensaoODS13/1.0 (https://github.com/matheusgeneze)"}
@@ -227,7 +196,7 @@ def _consultar_met_norway(lat: float, lon: float) -> dict:
         })
 
     return {
-        "fonte": "MET Norway API (Contingência)",
+        "fonte": "MET Norway Weather API",
         "current": {
             "temperature_2m": round(float(agora_det["air_temperature"]), 1),
             "relative_humidity_2m": int(round(float(agora_det["relative_humidity"]))),
@@ -238,13 +207,40 @@ def _consultar_met_norway(lat: float, lon: float) -> dict:
     }
 
 
+def _consultar_open_meteo(lat: float, lon: float) -> dict:
+    """Fonte secundária de contingência: Open-Meteo API."""
+    url = "https://api.open-meteo.com/v1/forecast"
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "current": "temperature_2m,relative_humidity_2m,precipitation,wind_speed_10m",
+        "daily": "temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max,uv_index_max",
+        "timezone": "America/Sao_Paulo",
+        "forecast_days": 7
+    }
+    resp = requests.get(url, params=params, timeout=8)
+    resp.raise_for_status()
+    raw = resp.json()
+
+    daily_df = pd.DataFrame(raw["daily"])
+    return {
+        "fonte": "Open-Meteo API",
+        "current": {
+            "temperature_2m": round(float(raw["current"]["temperature_2m"]), 1),
+            "relative_humidity_2m": int(round(float(raw["current"]["relative_humidity_2m"]))),
+            "precipitation": round(float(raw["current"]["precipitation"]), 1),
+            "wind_speed_10m": round(float(raw["current"]["wind_speed_10m"]), 1),
+        },
+        "daily": daily_df.to_dict(orient="records")
+    }
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def buscar_dados_clima(lat_round: float, lon_round: float) -> dict:
-    """Busca clima na Open-Meteo e aciona MET Norway automaticamente em caso de erro 429."""
     try:
-        return _consultar_open_meteo(lat_round, lon_round)
-    except Exception:
         return _consultar_met_norway(lat_round, lon_round)
+    except Exception:
+        return _consultar_open_meteo(lat_round, lon_round)
 
 
 # Cabeçalho
@@ -303,7 +299,7 @@ st.sidebar.info(
     "e orientar moradores sobre prevenção a eventos extremos."
 )
 
-# Consulta meteorológica com cache de 1h e contingência automática
+# Consulta meteorológica
 try:
     dados = buscar_dados_clima(round(lat, 2), round(lon, 2))
     atual = dados["current"]
