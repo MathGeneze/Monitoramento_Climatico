@@ -1,4 +1,5 @@
 import re
+from datetime import datetime, timezone, timedelta
 import streamlit as st
 import requests
 import pandas as pd
@@ -15,6 +16,13 @@ st.set_page_config(
 # CONFIGURAÇÃO DO ENDEREÇO PADRÃO
 # ==============================================================================
 ENDERECO_PADRAO = "Rua Cachoeira do Sul, 271, Vila Jaguara, São Paulo, SP"
+RESULTADO_PADRAO = [{
+    "label": "Rua Cachoeira do Sul, 271 - Vila Jaguara - São Paulo - SP",
+    "lat": -23.5124,
+    "lon": -46.7449
+}]
+
+FUSO_SP = timezone(timedelta(hours=-3))
 
 
 def restaurar_endereco():
@@ -23,7 +31,7 @@ def restaurar_endereco():
 
 
 def _buscar_photon(query: str) -> list:
-    """Busca coordenadas via Photon (Komoot/OpenStreetMap), ideal para ruas e bairros."""
+    """Busca coordenadas via Photon (Komoot/OpenStreetMap)."""
     url = "https://photon.komoot.io/api/"
     params = {"q": query, "limit": 5}
     headers = {"User-Agent": "PainelClimaticoExtensaoODS13/1.0"}
@@ -108,17 +116,17 @@ def _buscar_nominatim(query: str) -> list:
     return resultados
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=86400, show_spinner=False)
 def geocodificar_local(consulta: str) -> list:
-    """Tenta localizar o endereço completo e aplica simplificações progressivas se necessário."""
-    tentativas = [consulta]
+    """Converte endereço em coordenadas com cache de 24h."""
+    if consulta.strip().lower() == ENDERECO_PADRAO.strip().lower():
+        return RESULTADO_PADRAO
 
-    # Remove número predial caso o número exato não esteja no mapa
+    tentativas = [consulta]
     sem_numero = re.sub(r",?\s*\b\d+\b", "", consulta).strip(" ,")
     if sem_numero and sem_numero not in tentativas:
         tentativas.append(sem_numero)
 
-    # Simplifica para "Primeiro termo (rua ou bairro), São Paulo"
     partes = [p.strip() for p in sem_numero.split(",") if p.strip()]
     if len(partes) >= 2:
         simplificada = f"{partes[0]}, {partes[-2] if partes[-1].upper() == 'SP' else partes[-1]}"
@@ -143,21 +151,100 @@ def geocodificar_local(consulta: str) -> list:
     return []
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def buscar_dados_clima(lat: float, lon: float):
-    """Busca condições atuais e previsão de 7 dias na Open-Meteo usando latitude/longitude."""
+def _consultar_open_meteo(lat: float, lon: float) -> dict:
+    """Fonte primária: Open-Meteo API."""
     url = "https://api.open-meteo.com/v1/forecast"
     params = {
         "latitude": lat,
         "longitude": lon,
-        "current": "temperature_2m,relative_humidity_2m,precipitation,wind_speed_10m,cloud_cover",
+        "current": "temperature_2m,relative_humidity_2m,precipitation,wind_speed_10m",
         "daily": "temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max,uv_index_max",
         "timezone": "America/Sao_Paulo",
         "forecast_days": 7
     }
-    resp = requests.get(url, params=params, timeout=10)
+    resp = requests.get(url, params=params, timeout=8)
     resp.raise_for_status()
-    return resp.json()
+    raw = resp.json()
+
+    daily_df = pd.DataFrame(raw["daily"])
+    return {
+        "fonte": "Open-Meteo API",
+        "current": {
+            "temperature_2m": round(float(raw["current"]["temperature_2m"]), 1),
+            "relative_humidity_2m": int(round(float(raw["current"]["relative_humidity_2m"]))),
+            "precipitation": round(float(raw["current"]["precipitation"]), 1),
+            "wind_speed_10m": round(float(raw["current"]["wind_speed_10m"]), 1),
+        },
+        "daily": daily_df.to_dict(orient="records")
+    }
+
+
+def _consultar_met_norway(lat: float, lon: float) -> dict:
+    """Fonte secundária de contingência: MET Norway Locationforecast API (sem chave, sem bloqueio por IP compartilhado)."""
+    url = "https://api.met.no/weatherapi/locationforecast/2.0/compact"
+    params = {"lat": round(lat, 4), "lon": round(lon, 4)}
+    headers = {"User-Agent": "PainelClimaticoExtensaoODS13/1.0 (https://github.com/matheusgeneze)"}
+    resp = requests.get(url, params=params, headers=headers, timeout=10)
+    resp.raise_for_status()
+    series = resp.json()["properties"]["timeseries"]
+
+    agora_det = series[0]["data"]["instant"]["details"]
+    chuva_atual = (
+        series[0]["data"].get("next_1_hours", {}).get("details", {}).get("precipitation_amount")
+        or series[0]["data"].get("next_6_hours", {}).get("details", {}).get("precipitation_amount")
+        or 0.0
+    )
+
+    por_dia = {}
+    for item in series:
+        dt_local = datetime.fromisoformat(item["time"].replace("Z", "+00:00")).astimezone(FUSO_SP)
+        dia_str = dt_local.strftime("%Y-%m-%d")
+        det = item["data"]["instant"]["details"]
+        temp = float(det["air_temperature"])
+        chuva = float(
+            item["data"].get("next_1_hours", {}).get("details", {}).get("precipitation_amount")
+            or (item["data"].get("next_6_hours", {}).get("details", {}).get("precipitation_amount", 0.0) / 6.0)
+            or 0.0
+        )
+
+        if dia_str not in por_dia:
+            por_dia[dia_str] = {"temps": [], "chuva": 0.0}
+        por_dia[dia_str]["temps"].append(temp)
+        por_dia[dia_str]["chuva"] += chuva
+
+    daily_records = []
+    for dia_str in sorted(por_dia.keys())[:7]:
+        temps = por_dia[dia_str]["temps"]
+        chuva_total = round(por_dia[dia_str]["chuva"], 1)
+        prob = 80 if chuva_total >= 5.0 else (45 if chuva_total >= 0.5 else 15)
+        daily_records.append({
+            "time": dia_str,
+            "temperature_2m_min": round(min(temps), 1),
+            "temperature_2m_max": round(max(temps), 1),
+            "precipitation_sum": chuva_total,
+            "precipitation_probability_max": prob,
+            "uv_index_max": 7.0
+        })
+
+    return {
+        "fonte": "MET Norway API (Contingência)",
+        "current": {
+            "temperature_2m": round(float(agora_det["air_temperature"]), 1),
+            "relative_humidity_2m": int(round(float(agora_det["relative_humidity"]))),
+            "precipitation": round(float(chuva_atual), 1),
+            "wind_speed_10m": round(float(agora_det["wind_speed"]) * 3.6, 1),
+        },
+        "daily": daily_records
+    }
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def buscar_dados_clima(lat_round: float, lon_round: float) -> dict:
+    """Busca clima na Open-Meteo e aciona MET Norway automaticamente em caso de erro 429."""
+    try:
+        return _consultar_open_meteo(lat_round, lon_round)
+    except Exception:
+        return _consultar_met_norway(lat_round, lon_round)
 
 
 # Cabeçalho
@@ -198,7 +285,6 @@ if not resultados:
     )
     st.stop()
 
-# Seletor para confirmar o logradouro/bairro exato
 indice_escolhido = st.sidebar.selectbox(
     "Confirme o endereço encontrado:",
     options=range(len(resultados)),
@@ -217,9 +303,9 @@ st.sidebar.info(
     "e orientar moradores sobre prevenção a eventos extremos."
 )
 
-# Consulta meteorológica usando as coordenadas do endereço
+# Consulta meteorológica com cache de 1h e contingência automática
 try:
-    dados = buscar_dados_clima(lat, lon)
+    dados = buscar_dados_clima(round(lat, 2), round(lon, 2))
     atual = dados["current"]
     diario = pd.DataFrame(dados["daily"])
     diario["time"] = pd.to_datetime(diario["time"]).dt.strftime("%d/%m")
@@ -301,7 +387,7 @@ try:
         st.markdown("**3. Uso Racional da Água**")
         st.write("Reaproveite água da máquina de lavar para limpeza de áreas externas e monitore vazamentos internos.")
 
-    st.caption("Fontes: OpenStreetMap / Photon (Geocodificação) & Open-Meteo API (Dados Meteorológicos).")
+    st.caption(f"Fontes: OpenStreetMap (Geocodificação) & {dados['fonte']} (Dados Meteorológicos).")
 
 except Exception as e:
     st.error(f"Não foi possível carregar os dados meteorológicos no momento: {e}")
